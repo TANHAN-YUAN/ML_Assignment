@@ -1,11 +1,87 @@
 # [import of library]
+from pathlib import Path
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
-from pathlib import Path
 
 
 # [start of preprocessing functions]
+
+# (Physics & Real-World Domain Filter)
+def apply_physics_and_domain_filter(df, drop_ev_mode="strict"):
+    """
+    Enforces real-world ICE automotive physics and fleet domain constraints.
+    drop_ev_mode='strict': Drops any row where Vehicle_Type == 'Electric Truck' OR Make_and_Model == 'Tesla Semi' (retains 174,876 rows).
+    """
+    df_copy = df.copy()
+
+    # 1. Strictly drop Electric Vehicles
+    if drop_ev_mode == "strict":
+        ev_mask = (df_copy["Vehicle_Type"] == "Electric Truck") | (df_copy["Make_and_Model"] == "Tesla Semi")
+        df_copy = df_copy[~ev_mask].reset_index(drop=True)
+
+    # 2. Compute Vehicle_Age (needed for physical Usage_Hours ceiling)
+    current_year = 2026
+    if "Year_of_Manufacture" in df_copy.columns:
+        df_copy["Vehicle_Age"] = np.maximum(1, current_year - df_copy["Year_of_Manufacture"])
+        df_copy = df_copy.drop(columns=["Year_of_Manufacture"])
+
+    # 3. Preserve original payload ratio (PCR) before correcting Load_Capacity
+    raw_load_ratio = np.clip(df_copy["Actual_Load"] / df_copy["Load_Capacity"], 0.10, 1.05)
+
+    # 4. Align ICE Vehicle_Type and Load_Capacity (kg) with real-world Make_and_Model specs
+    light_models = ["Ford F-150", "Chevy Silverado"]
+    medium_models = ["Isuzu NPR"]
+    heavy_ice_models = ["Volvo FH", "Scania R-Series", "Mercedes Actros", "MAN TGX"]
+
+    df_copy.loc[df_copy["Make_and_Model"].isin(light_models), "Vehicle_Type"] = "Light Truck"
+    df_copy.loc[
+        df_copy["Make_and_Model"].isin(medium_models) &
+        (~df_copy["Vehicle_Type"].isin(["Medium Truck", "Refrigerated Truck"])),
+        "Vehicle_Type"
+    ] = "Medium Truck"
+    df_copy.loc[
+        df_copy["Make_and_Model"].isin(heavy_ice_models) &
+        (~df_copy["Vehicle_Type"].isin(["Heavy Truck", "Refrigerated Truck"])),
+        "Vehicle_Type"
+    ] = "Heavy Truck"
+
+    # Clamp Load_Capacity to realistic chassis payload ratings (kg)
+    df_copy.loc[df_copy["Make_and_Model"].isin(light_models), "Load_Capacity"] = (
+        df_copy.loc[df_copy["Make_and_Model"].isin(light_models), "Load_Capacity"].clip(1500, 2500)
+    )
+    df_copy.loc[df_copy["Make_and_Model"].isin(medium_models), "Load_Capacity"] = (
+        df_copy.loc[df_copy["Make_and_Model"].isin(medium_models), "Load_Capacity"].clip(5000, 10000)
+    )
+    df_copy.loc[df_copy["Make_and_Model"].isin(heavy_ice_models), "Load_Capacity"] = (
+        df_copy.loc[df_copy["Make_and_Model"].isin(heavy_ice_models), "Load_Capacity"].clip(15000, 25000)
+    )
+
+    # Recompute Actual_Load from realistic Load_Capacity and bounded load ratio
+    df_copy["Actual_Load"] = df_copy["Load_Capacity"] * raw_load_ratio
+
+    # 5. Enforce physical Usage_Hours ceiling (Max 4,500 operating hours/year of age)
+    max_possible_hours = df_copy["Vehicle_Age"] * 4500.0
+    df_copy["Usage_Hours"] = np.minimum(df_copy["Usage_Hours"], max_possible_hours)
+
+    # 6. Physical ICE sensor & downtime boundary checks
+    df_copy["Engine_Temperature"] = df_copy["Engine_Temperature"].clip(70.0, 125.0)
+    df_copy["Tire_Pressure"] = df_copy["Tire_Pressure"].clip(22.0, 44.0)
+    df_copy["Battery_Status"] = df_copy["Battery_Status"].clip(20.0, 100.0)
+    df_copy["Oil_Quality"] = df_copy["Oil_Quality"].clip(20.0, 100.0)
+
+    minor_mask = df_copy["Maintenance_Severity"] == "Minor Maintenance"
+    major_mask = df_copy["Maintenance_Severity"] == "Major Maintenance"
+    df_copy.loc[minor_mask, "Downtime_Maintenance"] = np.maximum(1.0, df_copy.loc[minor_mask, "Downtime_Maintenance"])
+    df_copy.loc[major_mask, "Downtime_Maintenance"] = np.maximum(4.0, df_copy.loc[major_mask, "Downtime_Maintenance"])
+
+    # 7. Synchronize derived engineering features (PCR, UIR, UER)
+    df_copy["PCR"] = (df_copy["Actual_Load"] / df_copy["Load_Capacity"]).round(4)
+    df_copy["UIR"] = (df_copy["Usage_Hours"] / (df_copy["Vehicle_Age"] * 2000.0)).round(4)
+    df_copy["UER"] = (df_copy["Usage_Hours"] / (df_copy["Maintenance_Cost"] + 1.0)).round(4)
+
+    return df_copy
+
 
 # (Helper: Missing Value Imputation for Week 1 Part B1 Benchmark)
 def apply_imputation(df, method="zero"):
@@ -27,7 +103,6 @@ def apply_log_scaling(df, columns):
     df_copy = df.copy()
     for col in columns:
         if col in df_copy.columns:
-            # Clip at 0 to ensure no negative values cause NaN in log1p
             df_copy[col] = np.log1p(np.maximum(0, df_copy[col]))
     return df_copy
 
@@ -62,7 +137,6 @@ def apply_sliding_windows_and_robust(df, group_cols, sort_col, sensor_columns, w
     df_copy = df.copy()
     valid_sensors = [c for c in sensor_columns if c in df_copy.columns]
 
-    # Sort chronologically by Usage_Hours within vehicle cohorts to form degradation trajectories
     df_copy = df_copy.sort_values(by=group_cols + [sort_col]).reset_index(drop=True)
 
     all_sensor_cols = list(valid_sensors)
@@ -71,15 +145,12 @@ def apply_sliding_windows_and_robust(df, group_cols, sort_col, sensor_columns, w
     for lag in range(1, window_size):
         for col in valid_sensors:
             lag_col_name = f"{col}_lag_{lag}"
-            # Create lag and backfill the initial boundary rows of each cohort
             df_copy[lag_col_name] = grouped[col].shift(lag).bfill()
             all_sensor_cols.append(lag_col_name)
 
-    # Restore original Vehicle_ID ordering
     if "Vehicle_ID" in df_copy.columns:
         df_copy = df_copy.sort_values(by="Vehicle_ID").reset_index(drop=True)
 
-    # Apply RobustScaler across both current and lagged sensor columns
     if all_sensor_cols:
         scaler = RobustScaler()
         df_copy[all_sensor_cols] = scaler.fit_transform(df_copy[all_sensor_cols])
@@ -145,7 +216,7 @@ def apply_ordinal_encoding(df, mappings):
 
 # [start of the main function]
 def main():
-    # Dynamically resolve the ML_Assignment root directory and Data_Set folder
+    # Dynamically resolve paths relative to SRC/data_prepprocessing.py
     base_dir = Path(__file__).resolve().parent.parent
     data_dir = base_dir / "Data_Set"
 
@@ -155,46 +226,33 @@ def main():
     df = pd.read_csv(file_path)
     print(f"   Initial shape: {df.shape}")
 
-    # (Drop column)
+    # (Drop column - includes metadata, hardware tags, and ignored CAN/Packet_Loss columns)
     cols_to_drop = [
-        "Last_Maintenance_Date",
-        "Maintenance_Severity_ID",
-        "Data_Split",
-        "FL_Client_ID",
-        "Partition_Type",
-        "Local_Epochs_Per_Round",
-        "Communication_Rounds",
-        "Pre_Event_Record",
+        "Last_Maintenance_Date", "Maintenance_Severity_ID", "Data_Split",
+        "FL_Client_ID", "Partition_Type", "Local_Epochs_Per_Round",
+        "Communication_Rounds", "Pre_Event_Record", "Historical_Maintenance_Cost",
+        "Communication_Interface", "Telematics_Gateway", "Edge_Device_Class",
+        "CAN_Message_Rate_Hz", "Sensor_Packet_Loss_Rate"
     ]
     df = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
-    print(f"2. Dropped metadata/duplicate columns. Shape: {df.shape}")
+    print(f"2. Dropped metadata/hardware/CAN columns. Shape: {df.shape}")
 
-    # Feature Engineering: Convert Year_of_Manufacture -> Vehicle_Age
-    if "Year_of_Manufacture" in df.columns:
-        current_year = 2026
-        df["Vehicle_Age"] = current_year - df["Year_of_Manufacture"]
-        df = df.drop(columns=["Year_of_Manufacture"])
-        print("3. Engineered 'Vehicle_Age' from 'Year_of_Manufacture'.")
+    # Apply Physics & Real-World Domain Filter with strict EV removal
+    df = apply_physics_and_domain_filter(df, drop_ev_mode="strict")
+    print(f"3. Applied Physics & Domain Filter (strictly removed EVs, fixed ICE specs). Shape: {df.shape}")
 
     # Optional: Run baseline imputation (change 'zero' to 'ffill' for Week 1 benchmarking)
-    # df = apply_imputation(df, method="zero")
+    df = apply_imputation(df, method="zero")
 
-    # Define feature groups according to the preprocessing strategy
+    # Define feature groups according to the preprocessing & EDA outlier strategy
     ordinal_mappings = {
         "Brake_Condition": {"Poor": 0, "Fair": 1, "Good": 2},
-        "Maintenance_Severity": {"Normal": 0, "Minor Maintenance": 1, "Major Maintenance": 2},
-        "Edge_Device_Class": {
-            "ARM_Cortex_A53": 0,
-            "ARM_Cortex_A72": 1,
-            "Automotive_ECU": 2,
-            "NVIDIA_Jetson_Nano": 3
-        }
+        "Maintenance_Severity": {"Normal": 0, "Minor Maintenance": 1, "Major Maintenance": 2}
     }
 
     one_hot_cols = [
         "Make_and_Model", "Vehicle_Type", "Route_Info", "Weather_Conditions",
-        "Road_Conditions", "Communication_Interface", "Telematics_Gateway",
-        "Maintenance_Type"
+        "Road_Conditions", "Maintenance_Type"
     ]
 
     sensor_sliding_cols = [
@@ -202,13 +260,11 @@ def main():
         "Battery_Status", "Vibration_Levels", "Oil_Quality"
     ]
 
-    robust_cols = ["Usage_Hours", "Load_Capacity", "Actual_Load"]
-
-    iqr_standard_cols = ["CAN_Message_Rate_Hz", "Sensor_Packet_Loss_Rate"]
+    # Included MBF, ADS, CMES in RobustScaler due to >9% heavy right-tail outliers found in EDA
+    robust_cols = ["Usage_Hours", "Load_Capacity", "Actual_Load", "MBF", "ADS", "CMES"]
 
     standard_cols = [
-        "Days_Since_Last_Maintenance", "PCR", "UIR", "TPI",
-        "MBF", "ADS", "OHI", "CMES", "UER"
+        "Days_Since_Last_Maintenance", "PCR", "UIR", "TPI", "OHI", "UER"
     ]
 
     minmax_cols = [
@@ -217,14 +273,12 @@ def main():
     ]
 
     log_reward_cols = [
-        "Maintenance_Cost", "Historical_Maintenance_Cost",
-        "Downtime_Maintenance", "Impact_on_Efficiency"
+        "Maintenance_Cost", "Downtime_Maintenance", "Impact_on_Efficiency"
     ]
 
     # Go through the pipeline
     print("4. Running preprocessing transformations...")
 
-    # Step A: Sliding windows MUST run before One-Hot Encoding so we can group by Make_and_Model & Vehicle_Type
     df = apply_sliding_windows_and_robust(
         df,
         group_cols=["Make_and_Model", "Vehicle_Type"],
@@ -234,22 +288,17 @@ def main():
     )
     print("   -> Sliding Windows (t-1, t-2) + RobustScaler applied to core sensors.")
 
-    # Step B: Encodings
     df = apply_ordinal_encoding(df, ordinal_mappings)
     print("   -> Ordinal Encoding applied.")
 
     df = apply_one_hot_encoding(df, one_hot_cols)
     print("   -> One-Hot Encoding applied.")
 
-    # Step C: Scalers & Clipping
     df = apply_robust_scaler(df, robust_cols)
-    print("   -> RobustScaler applied to usage/load metrics.")
-
-    df = apply_iqr_clipping_and_standard(df, iqr_standard_cols)
-    print("   -> IQR Clipping + StandardScaler applied to CAN/Telemetry rates.")
+    print("   -> RobustScaler applied to usage, load, and heavy-tailed engineering indices (MBF, ADS, CMES).")
 
     df = apply_standard_scaler(df, standard_cols)
-    print("   -> StandardScaler applied to advanced engineering indices.")
+    print("   -> StandardScaler applied to standard engineering indices.")
 
     df = apply_min_max_scaler(df, minmax_cols)
     print("   -> MinMaxScaler applied to age and discrete fault counts.")
@@ -257,12 +306,11 @@ def main():
     df = apply_log_scaling(df, log_reward_cols)
     print("   -> Log1p Scaling applied to cost/downtime reward features.")
 
-    # Drop Vehicle_ID after sorting/grouping so it doesn't pollute neural network weights
-    #if "Vehicle_ID" in df.columns:
-    #    df = df.drop(columns=["Vehicle_ID"])
-    #    print("5. Dropped 'Vehicle_ID' post-alignment.")
+    if "Vehicle_ID" in df.columns:
+        df = df.drop(columns=["Vehicle_ID"])
+        print("5. Dropped 'Vehicle_ID' post-alignment.")
 
-     # Update at the bottom of main() to save inside Data_Set/processed_dataset.csv
+    # (save the processed data into a dataset named "processed_dataset.csv" inside Data_Set/)
     output_path = data_dir / "processed_dataset.csv"
     print(f"6. Saving processed dataset to {output_path} (Final Shape: {df.shape})...")
     df.to_csv(output_path, index=False)
