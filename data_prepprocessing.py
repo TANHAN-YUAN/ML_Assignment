@@ -75,10 +75,9 @@ def apply_physics_and_domain_filter(df, drop_ev_mode="strict"):
     df_copy.loc[minor_mask, "Downtime_Maintenance"] = np.maximum(1.0, df_copy.loc[minor_mask, "Downtime_Maintenance"])
     df_copy.loc[major_mask, "Downtime_Maintenance"] = np.maximum(4.0, df_copy.loc[major_mask, "Downtime_Maintenance"])
 
-    # 7. Synchronize derived engineering features (PCR, UIR, UER)
+    # 7. Synchronize derived pre-event engineering features (PCR, UIR)
     df_copy["PCR"] = (df_copy["Actual_Load"] / df_copy["Load_Capacity"]).round(4)
     df_copy["UIR"] = (df_copy["Usage_Hours"] / (df_copy["Vehicle_Age"] * 2000.0)).round(4)
-    df_copy["UER"] = (df_copy["Usage_Hours"] / (df_copy["Maintenance_Cost"] + 1.0)).round(4)
 
     return df_copy
 
@@ -99,7 +98,7 @@ def apply_imputation(df, method="zero"):
 
 # (Log Scaling)
 def apply_log_scaling(df, columns):
-    """Applies log1p scaling to handle heavily skewed financial/downtime features."""
+    """Applies log1p scaling to handle heavily skewed financial/downtime/index features."""
     df_copy = df.copy()
     for col in columns:
         if col in df_copy.columns:
@@ -109,22 +108,29 @@ def apply_log_scaling(df, columns):
 
 # (StandardScaler)
 def apply_standard_scaler(df, columns):
-    """Standardizes features by removing the mean and scaling to unit variance."""
+    """Standardizes features while explicitly preserving column names and DataFrame index."""
     df_copy = df.copy()
     valid_cols = [c for c in columns if c in df_copy.columns]
     if valid_cols:
         scaler = StandardScaler()
-        df_copy[valid_cols] = scaler.fit_transform(df_copy[valid_cols])
+        scaled_array = scaler.fit_transform(df_copy[valid_cols])
+        df_copy[valid_cols] = pd.DataFrame(scaled_array, columns=valid_cols, index=df_copy.index)
     return df_copy
 
 
 # (One-Hot Encoding)
 def apply_one_hot_encoding(df, columns):
-    """Converts categorical variables into dummy/indicator variables (0 and 1)."""
+    """Converts categorical variables into dummy variables with clean, underscore-separated column names."""
     df_copy = df.copy()
     valid_cols = [c for c in columns if c in df_copy.columns]
     if valid_cols:
-        df_copy = pd.get_dummies(df_copy, columns=valid_cols, drop_first=False, dtype=int)
+        df_copy = pd.get_dummies(
+            df_copy, columns=valid_cols, prefix=valid_cols, prefix_sep="_", drop_first=False, dtype=int
+        )
+        df_copy.columns = [
+            str(col).strip().replace(" ", "_").replace("-", "_").replace("/", "_")
+            for col in df_copy.columns
+        ]
     return df_copy
 
 
@@ -132,7 +138,7 @@ def apply_one_hot_encoding(df, columns):
 def apply_sliding_windows_and_robust(df, group_cols, sort_col, sensor_columns, window_size=3):
     """
     Sorts by usage progression within vehicle cohorts, creates t-1 to t-(window_size-1)
-    lag features to capture degradation trajectories, and scales via RobustScaler.
+    lag features to capture degradation trajectories, and scales via RobustScaler with explicit column names.
     """
     df_copy = df.copy()
     valid_sensors = [c for c in sensor_columns if c in df_copy.columns]
@@ -153,14 +159,15 @@ def apply_sliding_windows_and_robust(df, group_cols, sort_col, sensor_columns, w
 
     if all_sensor_cols:
         scaler = RobustScaler()
-        df_copy[all_sensor_cols] = scaler.fit_transform(df_copy[all_sensor_cols])
+        scaled_array = scaler.fit_transform(df_copy[all_sensor_cols])
+        df_copy[all_sensor_cols] = pd.DataFrame(scaled_array, columns=all_sensor_cols, index=df_copy.index)
 
     return df_copy
 
 
 # (IQR Clipping + StandardScaler)
 def apply_iqr_clipping_and_standard(df, columns):
-    """Clips extreme outliers using the 1.5x Interquartile Range rule, then standardizes."""
+    """Clips extreme outliers using the 1.5x Interquartile Range rule, then standardizes with explicit column names."""
     df_copy = df.copy()
     valid_cols = [c for c in columns if c in df_copy.columns]
 
@@ -174,30 +181,33 @@ def apply_iqr_clipping_and_standard(df, columns):
 
     if valid_cols:
         scaler = StandardScaler()
-        df_copy[valid_cols] = scaler.fit_transform(df_copy[valid_cols])
+        scaled_array = scaler.fit_transform(df_copy[valid_cols])
+        df_copy[valid_cols] = pd.DataFrame(scaled_array, columns=valid_cols, index=df_copy.index)
 
     return df_copy
 
 
 # (RobustScaler)
 def apply_robust_scaler(df, columns):
-    """Scales features using median and IQR statistics that are robust to outliers."""
+    """Scales features using median and IQR statistics while explicitly preserving column names."""
     df_copy = df.copy()
     valid_cols = [c for c in columns if c in df_copy.columns]
     if valid_cols:
         scaler = RobustScaler()
-        df_copy[valid_cols] = scaler.fit_transform(df_copy[valid_cols])
+        scaled_array = scaler.fit_transform(df_copy[valid_cols])
+        df_copy[valid_cols] = pd.DataFrame(scaled_array, columns=valid_cols, index=df_copy.index)
     return df_copy
 
 
 # (MinMaxScaler)
 def apply_min_max_scaler(df, columns):
-    """Scales features to a strictly bounded [0, 1] range."""
+    """Scales features to [0, 1] while explicitly preserving column names."""
     df_copy = df.copy()
     valid_cols = [c for c in columns if c in df_copy.columns]
     if valid_cols:
         scaler = MinMaxScaler()
-        df_copy[valid_cols] = scaler.fit_transform(df_copy[valid_cols])
+        scaled_array = scaler.fit_transform(df_copy[valid_cols])
+        df_copy[valid_cols] = pd.DataFrame(scaled_array, columns=valid_cols, index=df_copy.index)
     return df_copy
 
 
@@ -216,26 +226,28 @@ def apply_ordinal_encoding(df, mappings):
 
 # [start of the main function]
 def main():
-    # Dynamically resolve paths relative to SRC/data_prepprocessing.py
-    base_dir = Path(__file__).resolve().parent.parent
+    # Auto-detect project root whether script is at project root or inside SRC/
+    script_dir = Path(__file__).resolve().parent
+    base_dir = script_dir if (script_dir / "Data_Set").exists() else script_dir.parent
     data_dir = base_dir / "Data_Set"
 
     # (import the dataset)
     file_path = data_dir / "logistics_predictive_maintenanceV2.csv"
     print(f"1. Loading dataset: {file_path}...")
-    df = pd.read_csv(file_path)
+    df = pd.read_csv(file_path, header=0)
     print(f"   Initial shape: {df.shape}")
 
-    # (Drop column - includes metadata, hardware tags, and ignored CAN/Packet_Loss columns)
+
+    # (Drop column - metadata, hardware tags, ignored CAN/Packet_Loss, and cost-leaking MBF/UER)
     cols_to_drop = [
         "Last_Maintenance_Date", "Maintenance_Severity_ID", "Data_Split",
         "FL_Client_ID", "Partition_Type", "Local_Epochs_Per_Round",
         "Communication_Rounds", "Pre_Event_Record", "Historical_Maintenance_Cost",
         "Communication_Interface", "Telematics_Gateway", "Edge_Device_Class",
-        "CAN_Message_Rate_Hz", "Sensor_Packet_Loss_Rate"
+        "CAN_Message_Rate_Hz", "Sensor_Packet_Loss_Rate", "MBF", "UER"
     ]
     df = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
-    print(f"2. Dropped metadata/hardware/CAN columns. Shape: {df.shape}")
+    print(f"2. Dropped metadata/hardware/CAN/cost-leaking columns. Shape: {df.shape}")
 
     # Apply Physics & Real-World Domain Filter with strict EV removal
     df = apply_physics_and_domain_filter(df, drop_ev_mode="strict")
@@ -260,11 +272,10 @@ def main():
         "Battery_Status", "Vibration_Levels", "Oil_Quality"
     ]
 
-    # Included MBF, ADS, CMES in RobustScaler due to >9% heavy right-tail outliers found in EDA
-    robust_cols = ["Usage_Hours", "Load_Capacity", "Actual_Load", "MBF", "ADS", "CMES"]
+    robust_cols = ["Usage_Hours", "Load_Capacity", "Actual_Load", "ADS", "CMES"]
 
     standard_cols = [
-        "Days_Since_Last_Maintenance", "PCR", "UIR", "TPI", "OHI", "UER"
+        "Days_Since_Last_Maintenance", "PCR", "UIR", "TPI", "OHI"
     ]
 
     minmax_cols = [
@@ -294,8 +305,10 @@ def main():
     df = apply_one_hot_encoding(df, one_hot_cols)
     print("   -> One-Hot Encoding applied.")
 
+    # Compress right-tail skewness on ADS and CMES before RobustScaler
+    df = apply_log_scaling(df, ["ADS", "CMES"])
     df = apply_robust_scaler(df, robust_cols)
-    print("   -> RobustScaler applied to usage, load, and heavy-tailed engineering indices (MBF, ADS, CMES).")
+    print("   -> Log1p + RobustScaler applied to usage, load, ADS, and CMES.")
 
     df = apply_standard_scaler(df, standard_cols)
     print("   -> StandardScaler applied to standard engineering indices.")
@@ -310,10 +323,23 @@ def main():
         df = df.drop(columns=["Vehicle_ID"])
         print("5. Dropped 'Vehicle_ID' post-alignment.")
 
+    # Partition columns: Stage 1 Input X first, RL Reward Metadata + Stage 1 Targets y at the end
+    maint_type_cols = [c for c in df.columns if c.startswith("Maintenance_Type_")]
+    end_cols = maint_type_cols + [
+        "Maintenance_Cost", "Downtime_Maintenance", "Impact_on_Efficiency",
+        "Maintenance_Severity", "Predictive_Score", "Maintenance_Required"
+    ]
+    feature_cols = [c for c in df.columns if c not in end_cols]
+    df = df[feature_cols + [c for c in end_cols if c in df.columns]]
+
+    print(f"   Stage 1 Input Features (X): {len(feature_cols)} columns | RL Metadata + Targets (y): {len(df.columns) - len(feature_cols)} columns")
+    print(f"   First 5 X columns: {list(df.columns[:5])}")
+    print(f"   Last 6 RL/Target columns: {list(df.columns[-6:])}")
+
     # (save the processed data into a dataset named "processed_dataset.csv" inside Data_Set/)
     output_path = data_dir / "processed_dataset.csv"
     print(f"6. Saving processed dataset to {output_path} (Final Shape: {df.shape})...")
-    df.to_csv(output_path, index=False)
+    df.to_csv(output_path, index=False, header=True)
     print("Preprocessing complete!")
 
 

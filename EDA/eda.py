@@ -8,7 +8,7 @@ import seaborn as sns
 def run_eda():
     # Resolve paths relative to SRC/EDA/eda.py
     eda_dir = Path(__file__).resolve().parent
-    base_dir = eda_dir.parent.parent
+    base_dir = eda_dir.parent if (eda_dir.parent / "Data_Set").exists() else eda_dir.parent.parent
     data_path = base_dir / "Data_Set" / "logistics_predictive_maintenanceV2.csv"
 
     print(f"1. Loading original dataset from: {data_path}")
